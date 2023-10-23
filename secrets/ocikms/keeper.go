@@ -3,7 +3,6 @@ package ocikms
 import (
 	"context"
 	"fmt"
-	"os"
 	"reflect"
 	"unsafe"
 
@@ -13,47 +12,51 @@ import (
 	"gocloud.dev/secrets"
 )
 
-func OpenKeeper(ctx context.Context, endpoint, keyid, algo string) (*secrets.Keeper, error) {
-	fmt.Println(endpoint, keyid, algo)
-	passwd := os.Getenv("OCI_PRIVATE_KEY_PASSWORD")
-	providers := []common.ConfigurationProvider{
-		common.ConfigurationProviderEnvironmentVariables("oci", passwd),
-		// oci sdk uses lower case for reading environment variables, follow them.
+func OpenKeeper(
+	ctx context.Context,
+	endpoint, keyid, algo string,
+	configProvider common.ConfigurationProvider,
+) (*secrets.Keeper, error) {
+	if configProvider == nil {
+		configProvider = newGCConfigurationProvider(nil)
 	}
-	if configFile := os.Getenv("OCI_CONFIG_FILE"); configFile != "" {
-		if p, err := common.ConfigurationProviderFromFile(configFile, passwd); err == nil {
-			providers = append(providers, p)
-		}
-	}
-	defaultConfig, _ := common.ComposingConfigurationProvider(providers)
 
-	kmsClient, err := keymanagement.NewKmsCryptoClientWithConfigurationProvider(defaultConfig, endpoint)
+	kmsClient, err := keymanagement.NewKmsCryptoClientWithConfigurationProvider(configProvider, endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init crypto client: %v", err)
 	}
-	alg, ok := keymanagement.GetMappingEncryptDataDetailsEncryptionAlgorithmEnum(algo)
+	_, ok := keymanagement.GetMappingEncryptDataDetailsEncryptionAlgorithmEnum(algo)
 	if !ok {
 		return nil, fmt.Errorf("invalid algo:" + algo)
 	}
 	return secrets.NewKeeper(&keeper{
-		client: kmsClient, keyid: keyid, algo: alg,
+		client: kmsClient, keyid: keyid, algo: algo,
 	}), nil
 }
 
 type keeper struct {
 	client keymanagement.KmsCryptoClient
 	keyid  string
-	algo   keymanagement.EncryptDataDetailsEncryptionAlgorithmEnum
+	algo   string
 }
 
 // Close implements driver.Keeper.
-func (*keeper) Close() error {
-	panic("unimplemented")
-}
+func (k *keeper) Close() error { return nil }
 
 // Decrypt implements driver.Keeper.
-func (*keeper) Decrypt(ctx context.Context, ciphertext []byte) ([]byte, error) {
-	panic("unimplemented")
+func (k *keeper) Decrypt(ctx context.Context, ciphertext []byte) ([]byte, error) {
+	req := keymanagement.DecryptRequest{
+		DecryptDataDetails: keymanagement.DecryptDataDetails{
+			KeyId:               &k.keyid,
+			Ciphertext:          (*string)(unsafe.Pointer(&ciphertext)),
+			EncryptionAlgorithm: keymanagement.DecryptDataDetailsEncryptionAlgorithmEnum(k.algo),
+		},
+	}
+	resp, err := k.client.Decrypt(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return fromStringPtr(resp.Plaintext), nil
 }
 
 // Encrypt implements driver.Keeper.
@@ -62,7 +65,7 @@ func (k *keeper) Encrypt(ctx context.Context, plaintext []byte) ([]byte, error) 
 		EncryptDataDetails: keymanagement.EncryptDataDetails{
 			KeyId:               &k.keyid,
 			Plaintext:           (*string)(unsafe.Pointer(&plaintext)),
-			EncryptionAlgorithm: k.algo,
+			EncryptionAlgorithm: keymanagement.EncryptDataDetailsEncryptionAlgorithmEnum(k.algo),
 		},
 	}
 	resp, err := k.client.Encrypt(ctx, encryptReq)

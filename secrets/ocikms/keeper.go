@@ -2,9 +2,12 @@ package ocikms
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"fmt"
-	"reflect"
-	"unsafe"
+	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/keymanagement"
@@ -17,20 +20,37 @@ func OpenKeeper(
 	endpoint, keyid, algo string,
 	configProvider common.ConfigurationProvider,
 ) (*secrets.Keeper, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !strings.Contains(endpoint, "://") {
+		endpoint = "https://" + endpoint
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, errors.New("OCI crypto endpoint requires HTTPS without credentials, query or fragment")
+	}
+	if keyid == "" {
+		return nil, errors.New("OCI Key Management requires a key reference")
+	}
+	algorithm, ok := keymanagement.GetMappingEncryptDataDetailsEncryptionAlgorithmEnum(algo)
+	if !ok {
+		return nil, errors.New("invalid encryption algorithm")
+	}
 	if configProvider == nil {
-		configProvider = newGCConfigurationProvider(nil)
+		var err error
+		configProvider, err = newGCConfigurationProvider(nil)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	kmsClient, err := keymanagement.NewKmsCryptoClientWithConfigurationProvider(configProvider, endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("failed to init crypto client: %v", err)
-	}
-	_, ok := keymanagement.GetMappingEncryptDataDetailsEncryptionAlgorithmEnum(algo)
-	if !ok {
-		return nil, fmt.Errorf("invalid algo:" + algo)
+		return nil, fmt.Errorf("failed to init crypto client: %w", err)
 	}
 	return secrets.NewKeeper(&keeper{
-		client: kmsClient, keyid: keyid, algo: algo,
+		client: kmsClient, keyid: keyid, algo: string(algorithm),
 	}), nil
 }
 
@@ -45,10 +65,11 @@ func (k *keeper) Close() error { return nil }
 
 // Decrypt implements driver.Keeper.
 func (k *keeper) Decrypt(ctx context.Context, ciphertext []byte) ([]byte, error) {
+	encoded := string(ciphertext)
 	req := keymanagement.DecryptRequest{
 		DecryptDataDetails: keymanagement.DecryptDataDetails{
 			KeyId:               &k.keyid,
-			Ciphertext:          (*string)(unsafe.Pointer(&ciphertext)),
+			Ciphertext:          &encoded,
 			EncryptionAlgorithm: keymanagement.DecryptDataDetailsEncryptionAlgorithmEnum(k.algo),
 		},
 	}
@@ -56,15 +77,19 @@ func (k *keeper) Decrypt(ctx context.Context, ciphertext []byte) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
-	return fromStringPtr(resp.Plaintext), nil
+	if resp.Plaintext == nil {
+		return nil, errors.New("OCI Decrypt response omitted plaintext")
+	}
+	return base64.StdEncoding.DecodeString(*resp.Plaintext)
 }
 
 // Encrypt implements driver.Keeper.
 func (k *keeper) Encrypt(ctx context.Context, plaintext []byte) ([]byte, error) {
+	encoded := base64.StdEncoding.EncodeToString(plaintext)
 	encryptReq := keymanagement.EncryptRequest{
 		EncryptDataDetails: keymanagement.EncryptDataDetails{
 			KeyId:               &k.keyid,
-			Plaintext:           (*string)(unsafe.Pointer(&plaintext)),
+			Plaintext:           &encoded,
 			EncryptionAlgorithm: keymanagement.EncryptDataDetailsEncryptionAlgorithmEnum(k.algo),
 		},
 	}
@@ -72,19 +97,42 @@ func (k *keeper) Encrypt(ctx context.Context, plaintext []byte) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
-	return fromStringPtr(resp.Ciphertext), nil
+	if resp.Ciphertext == nil {
+		return nil, errors.New("OCI Encrypt response omitted ciphertext")
+	}
+	return []byte(*resp.Ciphertext), nil
 }
 
 // ErrorAs implements driver.Keeper.
 func (*keeper) ErrorAs(err error, i interface{}) bool {
-	panic("unimplemented")
+	if target, ok := i.(*common.ServiceError); ok && target != nil {
+		return errors.As(err, target)
+	}
+	return false
 }
 
 // ErrorCode implements driver.Keeper.
 func (*keeper) ErrorCode(err error) gcerrors.ErrorCode {
-	return gcerrors.Unimplemented
-}
-
-func fromStringPtr(s *string) []byte {
-	return unsafe.Slice((*byte)(unsafe.Pointer((*reflect.StringHeader)(unsafe.Pointer(s)).Data)), len(*s))
+	if errors.Is(err, context.Canceled) {
+		return gcerrors.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return gcerrors.DeadlineExceeded
+	}
+	var native common.ServiceError
+	if !errors.As(err, &native) {
+		return gcerrors.Unknown
+	}
+	switch native.GetHTTPStatusCode() {
+	case http.StatusBadRequest:
+		return gcerrors.InvalidArgument
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return gcerrors.PermissionDenied
+	case http.StatusNotFound:
+		return gcerrors.NotFound
+	case http.StatusTooManyRequests:
+		return gcerrors.ResourceExhausted
+	default:
+		return gcerrors.Unknown
+	}
 }
